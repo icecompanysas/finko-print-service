@@ -1,0 +1,21 @@
+{
+  "name": "finko-print-service",
+  "version": "1.0.0",
+  "description": "Servicio local de impresión para Finko",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "pkg server.js --target node18-win-x64 --output dist/FinkoImprimir.exe --compress GZip"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "printer": "^0.5.0"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "assets": [],
+    "targets": ["node18-win-x64"]
+  }
+}

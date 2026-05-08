@@ -115,26 +115,74 @@ app.post('/print', async (req, res) => {
   const { printerName, escpos } = req.body
   if (!printerName || !escpos)
     return res.status(400).json({ error: 'Faltan printerName o escpos' })
+  console.log('  [PRINT] Impresora:', printerName, '| Bytes:', Buffer.from(escpos, 'binary').length)
   try {
     await printRaw(printerName, Buffer.from(escpos, 'binary'))
+    console.log('  [PRINT] OK - trabajo enviado al spooler')
     res.json({ ok: true })
   } catch (e) {
+    console.error('  [PRINT] ERROR:', String(e))
+    res.status(500).json({ error: String(e) })
+  }
+})
+
+// ─── POST /test-print ────────────────────────────────────────────────────────
+app.post('/test-print', async (req, res) => {
+  const { printerName } = req.body
+  if (!printerName) return res.status(400).json({ error: 'Falta printerName' })
+  const ESC = '\x1B', GS = '\x1D'
+  const test = ESC + '@' +
+    ESC + 'a\x01' + ESC + 'E\x01' + 'FINKO TEST\n' + ESC + 'E\x00' +
+    ESC + 'a\x00' + '-------------------\n' +
+    'Impresora: ' + printerName + '\n' +
+    'Si ves esto funciona!\n' +
+    '-------------------\n\n\n' +
+    GS + 'V\x41\x03'
+  console.log('  [TEST] Impresora:', printerName)
+  try {
+    await printRaw(printerName, Buffer.from(test, 'binary'))
+    console.log('  [TEST] OK')
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('  [TEST] ERROR:', String(e))
     res.status(500).json({ error: String(e) })
   }
 })
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
-app.listen(PORT, '127.0.0.1', async () => {
+const server = app.listen(PORT, async () => {
   console.log('')
-  console.log('  ✅  Finko Print Service corriendo en http://localhost:' + PORT)
-  console.log('  ℹ️   Deja esta ventana abierta mientras usas Finko.')
+  console.log('  \u2705  Finko Print Service corriendo en http://localhost:' + PORT)
+  console.log('  \u2139\uFE0F   Deja esta ventana abierta mientras usas Finko.')
   console.log('')
   const printers = await getPrinters()
   if (printers.length) {
     console.log('  Impresoras detectadas:')
-    printers.forEach(p => console.log('    •', p))
+    printers.forEach(p => console.log('    \u2022', p))
   } else {
-    console.log('  (No se detectaron impresoras aún)')
+    console.log('  (No se detectaron impresoras aun)')
   }
   console.log('')
+})
+
+server.on('error', (err) => {
+  console.error('')
+  if (err.code === 'EADDRINUSE') {
+    console.error('  ERROR: El puerto ' + PORT + ' ya esta en uso.')
+    console.error('  Cierra la otra ventana de Finko Print Service y vuelve a ejecutar.')
+  } else {
+    console.error('  ERROR al iniciar:', err.message)
+  }
+  console.error('')
+  console.log('  Presiona cualquier tecla para cerrar...')
+  process.stdin.setRawMode && process.stdin.setRawMode(true)
+  process.stdin.resume()
+  process.stdin.once('data', () => process.exit(1))
+  setTimeout(() => process.exit(1), 15000)
+})
+
+process.on('uncaughtException', (err) => {
+  console.error('\n  ERROR inesperado:', err.message)
+  console.error('  Presiona cualquier tecla para cerrar...')
+  setTimeout(() => process.exit(1), 15000)
 })

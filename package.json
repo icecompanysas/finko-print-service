@@ -1,20 +1,52 @@
 {
   "name": "finko-print-service",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Servicio local de impresión para Finko",
-  "main": "server.js",
+  "main": "main.js",
   "scripts": {
-    "start": "node server.js",
-    "build": "pkg server.js --target node18-win-x64 --output dist/FinkoImprimir.exe --compress GZip"
+    "start": "cmd /c \"set ELECTRON_RUN_AS_NODE= && electron .\"",
+    "server": "node server.js",
+    "build": "electron-builder --win --x64",
+    "build-exe": "pkg server.js --target node18-win-x64 --output dist/FinkoImprimir.exe --compress GZip"
   },
   "dependencies": {
     "express": "^4.18.2"
   },
   "devDependencies": {
+    "electron": "^30.0.6",
+    "electron-builder": "^24.13.3",
     "pkg": "^5.8.1"
+  },
+  "build": {
+    "appId": "com.finko.printservice",
+    "productName": "Finko Print Service",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    },
+    "files": [
+      "main.js",
+      "server.js",
+      "package.json",
+      "node_modules/**/*"
+    ]
   },
   "pkg": {
     "assets": [],
-    "targets": ["node18-win-x64"]
+    "targets": [
+      "node18-win-x64"
+    ]
   }
 }

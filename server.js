@@ -6,6 +6,36 @@ const os        = require('os')
 const app       = express()
 const PORT      = 6788
 
+// ─── Config persistente ───────────────────────────────────────────────────────
+const CONFIG_DIR  = path.join(os.homedir(), 'AppData', 'Roaming', 'FinkoPrint')
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
+
+function loadConfig() {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
+  } catch {}
+  return {}
+}
+
+function saveConfig(data) {
+  try {
+    if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true })
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(data, null, 2), 'utf8')
+  } catch {}
+}
+
+// Palabras clave que identifican impresoras térmicas POS
+const THERMAL_KEYWORDS = ['pos', 'thermal', 'receipt', 'epson', 'star', 'bixolon', 'xprinter',
+  'sewoo', 'rongta', 'citizen', '80mm', '58mm', 'ticket', 'recibo', 'termica', 'térmica']
+
+function detectThermalPrinter(printers) {
+  if (!printers.length) return null
+  if (printers.length === 1) return printers[0]
+  const lower = name => name.toLowerCase()
+  const thermal = printers.find(p => THERMAL_KEYWORDS.some(k => lower(p).includes(k)))
+  return thermal || printers[0]
+}
+
 // ─── CORS + Private Network Access ───────────────────────────────────────────
 // Permite que una página HTTPS (Vercel) haga fetch a http://localhost
 app.use((req, res, next) => {
@@ -103,18 +133,61 @@ function printRaw(printerName, buffer) {
 app.get('/status', async (_req, res) => {
   try {
     const printers = await getPrinters()
-    res.json({ ok: true, printers })
+    const cfg = loadConfig()
+    res.json({ ok: true, printers, defaultPrinter: cfg.defaultPrinter || null })
   } catch (e) {
-    res.json({ ok: true, printers: [], error: String(e) })
+    res.json({ ok: true, printers: [], defaultPrinter: null, error: String(e) })
   }
 })
 
+// ─── GET /default-printer ─────────────────────────────────────────────────────
+app.get('/default-printer', async (_req, res) => {
+  try {
+    const cfg = loadConfig()
+    if (cfg.defaultPrinter) {
+      return res.json({ ok: true, printer: cfg.defaultPrinter, source: 'saved' })
+    }
+    // Autodetectar
+    const printers = await getPrinters()
+    const detected = detectThermalPrinter(printers)
+    if (detected) {
+      saveConfig({ ...cfg, defaultPrinter: detected })
+      console.log('  [AUTO] Impresora detectada y guardada:', detected)
+      return res.json({ ok: true, printer: detected, source: 'auto' })
+    }
+    res.json({ ok: false, printer: null, source: 'none' })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) })
+  }
+})
+
+// ─── POST /default-printer ────────────────────────────────────────────────────
+app.post('/default-printer', (req, res) => {
+  const { printer } = req.body
+  if (!printer) return res.status(400).json({ error: 'Falta printer' })
+  const cfg = loadConfig()
+  saveConfig({ ...cfg, defaultPrinter: printer })
+  console.log('  [CONFIG] Impresora default guardada:', printer)
+  res.json({ ok: true })
+})
+
 // ─── POST /print  ─────────────────────────────────────────────────────────────
-// Body: { printerName: string, escpos: string (binary latin1) }
+// Body: { printerName?: string, escpos: string (binary latin1) }
+// Si printerName no se pasa, usa la impresora default guardada
 app.post('/print', async (req, res) => {
-  const { printerName, escpos } = req.body
-  if (!printerName || !escpos)
-    return res.status(400).json({ error: 'Faltan printerName o escpos' })
+  let { printerName, escpos } = req.body
+  if (!escpos) return res.status(400).json({ error: 'Falta escpos' })
+  if (!printerName) {
+    const cfg = loadConfig()
+    printerName = cfg.defaultPrinter
+    if (!printerName) {
+      const printers = await getPrinters()
+      printerName = detectThermalPrinter(printers)
+      if (printerName) saveConfig({ ...cfg, defaultPrinter: printerName })
+    }
+  }
+  if (!printerName)
+    return res.status(400).json({ error: 'No hay impresora configurada' })
   console.log('  [PRINT] Impresora:', printerName, '| Bytes:', Buffer.from(escpos, 'binary').length)
   try {
     await printRaw(printerName, Buffer.from(escpos, 'binary'))
@@ -153,14 +226,24 @@ app.post('/test-print', async (req, res) => {
 const server = app.listen(PORT, async () => {
   console.log('')
   console.log('  \u2705  Finko Print Service corriendo en http://localhost:' + PORT)
-  console.log('  \u2139\uFE0F   Deja esta ventana abierta mientras usas Finko.')
   console.log('')
   const printers = await getPrinters()
+  const cfg = loadConfig()
   if (printers.length) {
     console.log('  Impresoras detectadas:')
     printers.forEach(p => console.log('    \u2022', p))
+    // Autoguardar default si no hay una guardada
+    if (!cfg.defaultPrinter) {
+      const detected = detectThermalPrinter(printers)
+      if (detected) {
+        saveConfig({ ...cfg, defaultPrinter: detected })
+        console.log('  \u2B50 Impresora default auto-configurada:', detected)
+      }
+    } else {
+      console.log('  \u2B50 Impresora default:', cfg.defaultPrinter)
+    }
   } else {
-    console.log('  (No se detectaron impresoras aun)')
+    console.log('  (No se detectaron impresoras)')
   }
   console.log('')
 })

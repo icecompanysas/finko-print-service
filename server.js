@@ -9,6 +9,34 @@ const PORT      = 6788
 // ─── Config persistente ───────────────────────────────────────────────────────
 const CONFIG_DIR  = path.join(os.homedir(), 'AppData', 'Roaming', 'FinkoPrint')
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
+const DEST_EXE    = path.join(CONFIG_DIR, 'FinkoImprimir.exe')
+const STARTUP_DIR = path.join(os.homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+const STARTUP_VBS = path.join(STARTUP_DIR, 'FinkoPrintService.vbs')
+
+// Se instala solo la primera vez que se ejecuta
+function selfInstall() {
+  try {
+    if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true })
+
+    // Copiar el exe a AppData si no está ahí o si cambió
+    const exePath = process.execPath
+    const isAlreadyInstalled = exePath === DEST_EXE
+
+    if (!isAlreadyInstalled) {
+      fs.copyFileSync(exePath, DEST_EXE)
+      console.log('  📦 Copiado a:', DEST_EXE)
+    }
+
+    // Crear/actualizar el VBScript de inicio silencioso
+    const vbs = `Set oShell = CreateObject("WScript.Shell")\noShell.Run """${DEST_EXE}""", 0, False\n`
+    if (!fs.existsSync(STARTUP_VBS) || fs.readFileSync(STARTUP_VBS, 'utf8') !== vbs) {
+      fs.writeFileSync(STARTUP_VBS, vbs, 'utf8')
+      console.log('  ✅ Autostart configurado — se iniciará con Windows')
+    }
+  } catch (e) {
+    console.error('  ⚠️  No se pudo configurar autostart:', e.message)
+  }
+}
 
 function loadConfig() {
   try {
@@ -224,6 +252,7 @@ app.post('/test-print', async (req, res) => {
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, async () => {
+  selfInstall()
   console.log('')
   console.log('  \u2705  Finko Print Service corriendo en http://localhost:' + PORT)
   console.log('')

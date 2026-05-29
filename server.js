@@ -5,6 +5,7 @@ const path      = require('path')
 const os        = require('os')
 const app       = express()
 const PORT      = 6788
+const VERSION   = '1.3.0'
 
 // ─── Config persistente ───────────────────────────────────────────────────────
 const CONFIG_DIR  = path.join(os.homedir(), 'AppData', 'Roaming', 'FinkoPrint')
@@ -162,9 +163,9 @@ app.get('/status', async (_req, res) => {
   try {
     const printers = await getPrinters()
     const cfg = loadConfig()
-    res.json({ ok: true, printers, defaultPrinter: cfg.defaultPrinter || null })
+    res.json({ ok: true, printers, defaultPrinter: cfg.defaultPrinter || null, version: VERSION })
   } catch (e) {
-    res.json({ ok: true, printers: [], defaultPrinter: null, error: String(e) })
+    res.json({ ok: true, printers: [], defaultPrinter: null, version: VERSION, error: String(e) })
   }
 })
 
@@ -254,7 +255,7 @@ app.post('/test-print', async (req, res) => {
 const server = app.listen(PORT, async () => {
   selfInstall()
   console.log('')
-  console.log('  \u2705  Finko Print Service corriendo en http://localhost:' + PORT)
+  console.log('  \u2705  Finko Print Service v' + VERSION + ' corriendo en http://localhost:' + PORT)
   console.log('')
   const printers = await getPrinters()
   const cfg = loadConfig()

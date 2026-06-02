@@ -1,11 +1,14 @@
 const { app, Tray, Menu, nativeImage } = require('electron')
 const zlib = require('zlib')
+const http = require('http')
 
 // Una sola instancia
 if (!app.requestSingleInstanceLock()) { app.quit(); process.exit(0) }
 
 let tray = null
 let serverOk = false
+let printerList = []
+let currentPrinter = ''
 
 // ─── Icono naranja 16×16 generado en código (sin archivos externos) ───────────
 function makeIcon() {
@@ -51,12 +54,68 @@ function makeIcon() {
   ]))
 }
 
+// ─── Llamada HTTP local al servidor ──────────────────────────────────────────
+function apiGet(path) {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:6788${path}`, { timeout: 3000 }, (res) => {
+      let body = ''
+      res.on('data', d => body += d)
+      res.on('end', () => { try { resolve(JSON.parse(body)) } catch { resolve(null) } })
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+  })
+}
+
+function apiPost(path, data) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify(data)
+    const req = http.request({ host: 'localhost', port: 6788, path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 3000 }, (res) => {
+      let b = ''; res.on('data', d => b += d)
+      res.on('end', () => { try { resolve(JSON.parse(b)) } catch { resolve(null) } })
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+    req.write(body); req.end()
+  })
+}
+
+// ─── Refresca lista de impresoras y reconstruye el menú ───────────────────────
+async function refreshPrinters() {
+  const status = await apiGet('/status')
+  if (status && status.printers) {
+    printerList = status.printers
+    currentPrinter = status.defaultPrinter || ''
+    if (tray) tray.setContextMenu(buildMenu())
+  }
+}
+
 // ─── Menú del tray ────────────────────────────────────────────────────────────
 function buildMenu() {
   const autoStart = app.getLoginItemSettings().openAtLogin
+
+  const printerItems = printerList.length
+    ? printerList.map(p => ({
+        label: p,
+        type: 'radio',
+        checked: p === currentPrinter,
+        click: async () => {
+          await apiPost('/default-printer', { printer: p })
+          currentPrinter = p
+          tray.setContextMenu(buildMenu())
+        }
+      }))
+    : [{ label: 'Cargando impresoras…', enabled: false }]
+
   return Menu.buildFromTemplate([
     { label: 'Finko Print Service', enabled: false },
     { label: serverOk ? '● Activo  —  puerto 6788' : '○ Error al iniciar', enabled: false },
+    { type: 'separator' },
+    { label: currentPrinter ? `Impresora: ${currentPrinter}` : 'Sin impresora seleccionada', enabled: false },
+    { label: 'Cambiar impresora', submenu: printerItems },
+    { label: 'Actualizar lista', click: () => refreshPrinters() },
     { type: 'separator' },
     {
       label: 'Iniciar con Windows',
@@ -89,6 +148,9 @@ app.whenReady().then(() => {
   tray = new Tray(makeIcon())
   tray.setToolTip(serverOk ? 'Finko Print  —  Activo' : 'Finko Print  —  Error')
   tray.setContextMenu(buildMenu())
+
+  // Cargar impresoras tras un breve delay (el servidor necesita arrancar)
+  if (serverOk) setTimeout(() => refreshPrinters(), 2000)
 })
 
 // Mantener la app viva aunque no haya ventanas

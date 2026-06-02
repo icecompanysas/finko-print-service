@@ -158,6 +158,54 @@ function printRaw(printerName, buffer) {
   })
 }
 
+// ─── GET / → Página de configuración de impresora ────────────────────────────
+app.get('/', async (_req, res) => {
+  const printers = await getPrinters()
+  const cfg = loadConfig()
+  const current = cfg.defaultPrinter || ''
+  const rows = printers.map(p => `
+    <tr class="${p === current ? 'active' : ''}" onclick="select('${p.replace(/'/g, "\\'")}')">
+      <td class="dot">${p === current ? '●' : '○'}</td>
+      <td>${p}</td>
+      <td class="btn-cell"><button onclick="event.stopPropagation();select('${p.replace(/'/g, "\\'")}')">Usar esta</button></td>
+    </tr>`).join('')
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<title>Finko Print — Impresoras</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,sans-serif;background:#111;color:#eee;padding:24px;min-height:100vh}
+  h1{font-size:1.2rem;font-weight:700;color:#ff6600;margin-bottom:4px}
+  p.sub{font-size:.8rem;color:#777;margin-bottom:20px}
+  table{width:100%;border-collapse:collapse;font-size:.9rem}
+  tr{cursor:pointer;border-bottom:1px solid #222;transition:background .15s}
+  tr:hover{background:#1a1a1a}
+  tr.active{background:#1f1200}
+  td{padding:12px 10px}
+  td.dot{width:28px;font-size:1rem;color:#ff6600}
+  td.btn-cell{width:110px;text-align:right}
+  button{background:#ff6600;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-size:.8rem;cursor:pointer}
+  button:hover{background:#e55}
+  .ok{margin-top:16px;padding:10px 14px;background:#0f2e0f;border:1px solid #2a5;border-radius:8px;color:#4c4;font-size:.85rem;display:none}
+  .none{color:#555;padding:20px 0}
+  .refresh{margin-top:18px;font-size:.8rem;color:#555;cursor:pointer;text-decoration:underline}
+</style></head><body>
+<h1>Finko Print Service v${VERSION}</h1>
+<p class="sub">● Activo en puerto 6788${current ? ' &nbsp;·&nbsp; Impresora actual: <strong style="color:#ff6600">' + current + '</strong>' : ''}</p>
+${printers.length
+  ? `<table><tbody>${rows}</tbody></table>`
+  : '<p class="none">No se detectaron impresoras instaladas.</p>'}
+<div class="ok" id="ok">✔ Impresora guardada correctamente</div>
+<p class="refresh" onclick="location.reload()">↻ Actualizar lista</p>
+<script>
+async function select(name) {
+  await fetch('/default-printer', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer:name})})
+  document.getElementById('ok').style.display='block'
+  setTimeout(()=>location.reload(), 800)
+}
+</script></body></html>`)
+})
+
 // ─── GET /status  ─────────────────────────────────────────────────────────────
 app.get('/status', async (_req, res) => {
   try {
@@ -256,19 +304,17 @@ const server = app.listen(PORT, async () => {
   selfInstall()
   console.log('')
   console.log('  \u2705  Finko Print Service v' + VERSION + ' corriendo en http://localhost:' + PORT)
+  console.log('  \uD83D\uDD27  Seleccionar impresora: http://localhost:' + PORT)
   console.log('')
   const printers = await getPrinters()
   const cfg = loadConfig()
   if (printers.length) {
     console.log('  Impresoras detectadas:')
     printers.forEach(p => console.log('    \u2022', p))
-    // Autoguardar default si no hay una guardada
     if (!cfg.defaultPrinter) {
-      const detected = detectThermalPrinter(printers)
-      if (detected) {
-        saveConfig({ ...cfg, defaultPrinter: detected })
-        console.log('  \u2B50 Impresora default auto-configurada:', detected)
-      }
+      // Sin impresora guardada \u2192 abrir p\u00E1gina de selecci\u00F3n en el navegador
+      console.log('  \u26A0\uFE0F  Sin impresora configurada \u2014 abriendo selector...')
+      exec('start http://localhost:' + PORT)
     } else {
       console.log('  \u2B50 Impresora default:', cfg.defaultPrinter)
     }

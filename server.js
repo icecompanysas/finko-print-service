@@ -5,7 +5,7 @@ const path      = require('path')
 const os        = require('os')
 const app       = express()
 const PORT      = 6788
-const VERSION   = '1.3.0'
+const VERSION   = '1.6.0'
 
 // ─── Config persistente ───────────────────────────────────────────────────────
 const CONFIG_DIR  = path.join(os.homedir(), 'AppData', 'Roaming', 'FinkoPrint')
@@ -65,6 +65,11 @@ function detectThermalPrinter(printers) {
   return thermal || printers[0]
 }
 
+// Cache de impresoras en memoria — se actualiza cada 30s para que /status responda instantáneo
+let cachedPrinters = []
+getPrinters().then(p => { cachedPrinters = p })
+setInterval(() => getPrinters().then(p => { cachedPrinters = p }), 30000)
+
 // ─── CORS + Private Network Access ───────────────────────────────────────────
 // Permite que una página HTTPS (Vercel) haga fetch a http://localhost
 app.use((req, res, next) => {
@@ -77,6 +82,155 @@ app.use((req, res, next) => {
 })
 
 app.use(express.json({ limit: '2mb' }))
+
+// ─── Balanza / Báscula RS-232 ─────────────────────────────────────────────────
+// Carga serialport de forma opcional — si no está instalado el resto del servicio
+// sigue funcionando normal; solo la sección de balanza queda inactiva.
+let SerialPort = null
+let ReadlineParser = null
+try {
+  SerialPort    = require('serialport').SerialPort
+  ReadlineParser = require('@serialport/parser-readline').ReadlineParser
+} catch (e) {
+  console.warn('  ⚠️  serialport no disponible — balanza desactivada')
+}
+
+function detectScaleParser(rawSample) {
+  if (!rawSample) return null
+  const sample = rawSample.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim()
+  if (!sample) return null
+
+  // Caso 1: número con punto decimal — "12.350", "+001.250", "ST,+001.250kg"
+  const decMatch = sample.match(/([+-]?0*(\d+\.\d+))/)
+  if (decMatch) {
+    const cleanNum = parseFloat(decMatch[2])
+    const after    = sample.slice(sample.indexOf(decMatch[1]) + decMatch[1].length).toLowerCase().trim()
+    let unit = 'kg', factor = 1
+    if (/^lb/.test(after))               { unit = 'lb'; factor = 0.453592 }
+    else if (/^g(?:[^k]|$)/.test(after)) { unit = 'g';  factor = 0.001    }
+    return { regex: '[+-]?0*(\\d+\\.\\d+)', unit, factor, detected_weight: cleanNum * factor, sample }
+  }
+
+  // Caso 2: entero largo (gramos sin decimal) — "000123"
+  const intMatch = sample.match(/([+-]?0*(\d{3,}))/)
+  if (intMatch) {
+    const cleanNum = parseFloat(intMatch[2])
+    const after    = sample.slice(sample.indexOf(intMatch[1]) + intMatch[1].length).toLowerCase().trim()
+    let unit = 'g', factor = 0.001
+    if (/^kg/.test(after)) { unit = 'kg'; factor = 1 }
+    return { regex: '[+-]?0*(\\d+)', unit, factor, detected_weight: cleanNum * factor, sample }
+  }
+  return null
+}
+
+let scalePort     = null   // instancia SerialPort activa
+let scaleLastLines = []    // últimas tramas crudas recibidas
+let scaleLastPeso  = null  // último peso en kg
+let scaleLastTime  = null  // timestamp del último peso
+
+function applyScaleParser(line, parser) {
+  if (!parser?.regex) return null
+  try {
+    const m = line.match(new RegExp(parser.regex))
+    if (!m) return null
+    const v = parseFloat(m[1])
+    return (isNaN(v) || v < 0) ? null : v * (parser.factor || 1)
+  } catch { return null }
+}
+
+function connectScale(cfg) {
+  if (scalePort) { try { scalePort.close() } catch {} scalePort = null }
+  scaleLastPeso = null; scaleLastTime = null; scaleLastLines = []
+  if (!SerialPort || !cfg?.port) return
+  try {
+    const sp = new SerialPort({ path: cfg.port, baudRate: cfg.baud || 9600,
+      dataBits: 8, parity: 'none', stopBits: 1, autoOpen: true })
+    const parser = sp.pipe(new ReadlineParser({ delimiter: '\n' }))
+    parser.on('data', (raw) => {
+      const line = raw.toString().replace(/\r/g, '').trim()
+      if (!line) return
+      scaleLastLines.unshift(line)
+      if (scaleLastLines.length > 10) scaleLastLines.pop()
+      const peso = applyScaleParser(line, cfg.parser)
+      if (peso !== null) { scaleLastPeso = peso; scaleLastTime = Date.now() }
+    })
+    sp.on('error', (err) => console.error('  [BALANZA] Error serial:', err.message))
+    sp.on('close', () => { console.log('  [BALANZA] Puerto cerrado'); scalePort = null })
+    scalePort = sp
+    console.log('  [BALANZA] Conectado a', cfg.port, '@', cfg.baud || 9600, 'bps')
+  } catch (e) {
+    console.error('  [BALANZA] No se pudo abrir', cfg?.port, ':', e.message)
+  }
+}
+
+// Init balanza: leer config guardada y conectar si hay puerto configurado
+;(function initScale() {
+  const cfg = loadConfig()
+  if (cfg.scale?.port) {
+    console.log('  [BALANZA] Conectando a', cfg.scale.port, '...')
+    connectScale(cfg.scale)
+  }
+})()
+
+// ── Endpoints de balanza ──────────────────────────────────────────────────────
+
+// Puertos COM disponibles
+app.get('/balanza/ports', async (_req, res) => {
+  if (!SerialPort) return res.json([])
+  try {
+    const ports = await SerialPort.list()
+    res.json(ports.map(p => ({ path: p.path, manufacturer: p.manufacturer || '' })))
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Estado de la balanza (lo usa el frontend para saber si está conectada)
+app.get('/balanza/status', async (_req, res) => {
+  const cfg = loadConfig()
+  let ports = []
+  if (SerialPort) { try { ports = await SerialPort.list() } catch {} }
+  res.json({
+    available: !!SerialPort,
+    connected: !!scalePort,
+    config: cfg.scale || null,
+    ports: ports.map(p => ({ path: p.path, manufacturer: p.manufacturer || '' })),
+    last_peso: scaleLastPeso,
+    last_peso_age_ms: scaleLastTime ? Date.now() - scaleLastTime : null,
+  })
+})
+
+// Guardar config y reconectar
+app.post('/balanza/config', (req, res) => {
+  const { port, baud, parser } = req.body
+  if (!port) return res.status(400).json({ error: 'Falta port' })
+  const cfg = loadConfig()
+  cfg.scale = { port, baud: Number(baud) || 9600, parser: parser || null }
+  saveConfig(cfg)
+  connectScale(cfg.scale)
+  res.json({ ok: true })
+})
+
+// Auto-detectar parser desde muestra pegada
+app.post('/balanza/detect', (req, res) => {
+  const { sample } = req.body
+  if (!sample) return res.status(400).json({ error: 'Falta sample' })
+  const result = detectScaleParser(sample)
+  if (!result) return res.status(422).json({ error: 'No se detectó un valor numérico en la muestra' })
+  res.json(result)
+})
+
+// Peso actual — lo llama el POS en tiempo real al pesar un producto
+app.get('/balanza/peso', (_req, res) => {
+  if (!scalePort)       return res.status(503).json({ error: 'Sin conexión a balanza', connected: false })
+  if (scaleLastPeso === null) return res.status(503).json({ error: 'Esperando primera lectura...', connected: true })
+  const age = scaleLastTime ? Date.now() - scaleLastTime : 9999
+  if (age > 5000)       return res.status(503).json({ error: 'Lectura desactualizada', connected: true })
+  res.json({ peso: scaleLastPeso, unidad: 'kg', raw: scaleLastLines[0] || '', age_ms: age })
+})
+
+// Últimas líneas crudas (para diagnóstico y captura de muestra desde el frontend)
+app.get('/balanza/capture', (_req, res) => {
+  res.json({ lines: scaleLastLines, connected: !!scalePort })
+})
 
 // ─── Lista de impresoras via PowerShell ───────────────────────────────────────
 function getPrinters() {
@@ -207,14 +361,9 @@ async function select(name) {
 })
 
 // ─── GET /status  ─────────────────────────────────────────────────────────────
-app.get('/status', async (_req, res) => {
-  try {
-    const printers = await getPrinters()
-    const cfg = loadConfig()
-    res.json({ ok: true, printers, defaultPrinter: cfg.defaultPrinter || null, version: VERSION })
-  } catch (e) {
-    res.json({ ok: true, printers: [], defaultPrinter: null, version: VERSION, error: String(e) })
-  }
+app.get('/status', (_req, res) => {
+  const cfg = loadConfig()
+  res.json({ ok: true, printers: cachedPrinters, defaultPrinter: cfg.defaultPrinter || null, version: VERSION })
 })
 
 // ─── GET /default-printer ─────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ const path      = require('path')
 const os        = require('os')
 const app       = express()
 const PORT      = 6788
-const VERSION   = '1.6.0'
+const VERSION   = '1.7.0'
 
 // ─── Config persistente ───────────────────────────────────────────────────────
 const CONFIG_DIR  = path.join(os.homedir(), 'AppData', 'Roaming', 'FinkoPrint')

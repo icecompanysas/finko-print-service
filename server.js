@@ -84,16 +84,9 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '2mb' }))
 
 // ─── Balanza / Báscula RS-232 ─────────────────────────────────────────────────
-// Carga serialport de forma opcional — si no está instalado el resto del servicio
-// sigue funcionando normal; solo la sección de balanza queda inactiva.
-let SerialPort = null
-let ReadlineParser = null
-try {
-  SerialPort    = require('serialport').SerialPort
-  ReadlineParser = require('@serialport/parser-readline').ReadlineParser
-} catch (e) {
-  console.warn('  ⚠️  serialport no disponible — balanza desactivada')
-}
+// Usa System.IO.Ports de .NET via PowerShell — igual que la impresión,
+// sin módulos nativos, compatible con pkg sin configuración extra.
+const { spawn } = require('child_process')
 
 function detectScaleParser(rawSample) {
   if (!rawSample) return null
@@ -123,7 +116,7 @@ function detectScaleParser(rawSample) {
   return null
 }
 
-let scalePort     = null   // instancia SerialPort activa
+let scaleProc      = null  // proceso PowerShell leyendo el puerto
 let scaleLastLines = []    // últimas tramas crudas recibidas
 let scaleLastPeso  = null  // último peso en kg
 let scaleLastTime  = null  // timestamp del último peso
@@ -139,28 +132,46 @@ function applyScaleParser(line, parser) {
 }
 
 function connectScale(cfg) {
-  if (scalePort) { try { scalePort.close() } catch {} scalePort = null }
+  if (scaleProc) { try { scaleProc.kill() } catch {} scaleProc = null }
   scaleLastPeso = null; scaleLastTime = null; scaleLastLines = []
-  if (!SerialPort || !cfg?.port) return
-  try {
-    const sp = new SerialPort({ path: cfg.port, baudRate: cfg.baud || 9600,
-      dataBits: 8, parity: 'none', stopBits: 1, autoOpen: true })
-    const parser = sp.pipe(new ReadlineParser({ delimiter: '\n' }))
-    parser.on('data', (raw) => {
-      const line = raw.toString().replace(/\r/g, '').trim()
-      if (!line) return
+  if (!cfg?.port) return
+
+  // Leer el puerto serial con System.IO.Ports (.NET built-in en Windows)
+  // — mismo enfoque que la impresión con PowerShell, sin módulos nativos
+  const ps = `
+try {
+  $p = New-Object System.IO.Ports.SerialPort('${cfg.port}', ${cfg.baud || 9600}, 'None', 8, 1)
+  $p.ReadTimeout = 3000
+  $p.NewLine = "\`n"
+  $p.Open()
+  while ($true) {
+    try { $line = $p.ReadLine(); if ($line) { Write-Host $line; [Console]::Out.Flush() } }
+    catch [System.TimeoutException] {}
+  }
+} catch { Write-Error $_.Exception.Message }
+finally { if ($p -and $p.IsOpen) { $p.Close() } }
+`.trim()
+
+  const proc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  proc.stdout.on('data', (data) => {
+    for (const raw of data.toString().split('\n')) {
+      const line = raw.replace(/\r/g, '').trim()
+      if (!line) continue
       scaleLastLines.unshift(line)
       if (scaleLastLines.length > 10) scaleLastLines.pop()
       const peso = applyScaleParser(line, cfg.parser)
       if (peso !== null) { scaleLastPeso = peso; scaleLastTime = Date.now() }
-    })
-    sp.on('error', (err) => console.error('  [BALANZA] Error serial:', err.message))
-    sp.on('close', () => { console.log('  [BALANZA] Puerto cerrado'); scalePort = null })
-    scalePort = sp
-    console.log('  [BALANZA] Conectado a', cfg.port, '@', cfg.baud || 9600, 'bps')
-  } catch (e) {
-    console.error('  [BALANZA] No se pudo abrir', cfg?.port, ':', e.message)
-  }
+    }
+  })
+
+  proc.stderr.on('data', (d) => console.error('  [BALANZA] Error:', d.toString().trim()))
+  proc.on('exit', (code) => { console.log('  [BALANZA] Proceso terminado, código', code); scaleProc = null })
+
+  scaleProc = proc
+  console.log('  [BALANZA] Conectado a', cfg.port, '@', cfg.baud || 9600, 'bps')
 }
 
 // Init balanza: leer config guardada y conectar si hay puerto configurado
@@ -174,25 +185,43 @@ function connectScale(cfg) {
 
 // ── Endpoints de balanza ──────────────────────────────────────────────────────
 
-// Puertos COM disponibles
+// Puertos COM disponibles — usa WMIC (built-in Windows, sin módulos nativos)
+function listComPorts() {
+  return new Promise((resolve) => {
+    exec(
+      'powershell -NoProfile -Command "Get-WmiObject Win32_PnPEntity | Where-Object { $_.Name -match \'COM\\d+\' } | Select-Object Name, Description | ConvertTo-Json -Compress"',
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) { resolve([]); return }
+        try {
+          const raw = stdout.trim()
+          if (!raw) { resolve([]); return }
+          const parsed = JSON.parse(raw)
+          const items = Array.isArray(parsed) ? parsed : [parsed]
+          const ports = items.map(p => {
+            const m = (p.Name || '').match(/\((COM\d+)\)/)
+            return m ? { path: m[1], manufacturer: (p.Description || '').replace(/\s*\(COM\d+\)/, '').trim() } : null
+          }).filter(Boolean)
+          resolve(ports)
+        } catch { resolve([]) }
+      }
+    )
+  })
+}
+
 app.get('/balanza/ports', async (_req, res) => {
-  if (!SerialPort) return res.json([])
-  try {
-    const ports = await SerialPort.list()
-    res.json(ports.map(p => ({ path: p.path, manufacturer: p.manufacturer || '' })))
-  } catch (e) { res.status(500).json({ error: e.message }) }
+  res.json(await listComPorts())
 })
 
 // Estado de la balanza (lo usa el frontend para saber si está conectada)
 app.get('/balanza/status', async (_req, res) => {
   const cfg = loadConfig()
-  let ports = []
-  if (SerialPort) { try { ports = await SerialPort.list() } catch {} }
+  const ports = await listComPorts()
   res.json({
-    available: !!SerialPort,
-    connected: !!scalePort,
+    available: true,
+    connected: !!scaleProc,
     config: cfg.scale || null,
-    ports: ports.map(p => ({ path: p.path, manufacturer: p.manufacturer || '' })),
+    ports,
     last_peso: scaleLastPeso,
     last_peso_age_ms: scaleLastTime ? Date.now() - scaleLastTime : null,
   })
@@ -220,10 +249,10 @@ app.post('/balanza/detect', (req, res) => {
 
 // Peso actual — lo llama el POS en tiempo real al pesar un producto
 app.get('/balanza/peso', (_req, res) => {
-  if (!scalePort)       return res.status(503).json({ error: 'Sin conexión a balanza', connected: false })
+  if (!scaleProc)            return res.status(503).json({ error: 'Sin conexión a balanza', connected: false })
   if (scaleLastPeso === null) return res.status(503).json({ error: 'Esperando primera lectura...', connected: true })
   const age = scaleLastTime ? Date.now() - scaleLastTime : 9999
-  if (age > 5000)       return res.status(503).json({ error: 'Lectura desactualizada', connected: true })
+  if (age > 5000)            return res.status(503).json({ error: 'Lectura desactualizada', connected: true })
   res.json({ peso: scaleLastPeso, unidad: 'kg', raw: scaleLastLines[0] || '', age_ms: age })
 })
 

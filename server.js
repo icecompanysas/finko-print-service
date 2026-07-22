@@ -3,6 +3,7 @@ const { exec }  = require('child_process')
 const fs        = require('fs')
 const path      = require('path')
 const os        = require('os')
+const net       = require('net')
 const app       = express()
 const PORT      = 6788
 const VERSION   = '1.7.0'
@@ -175,13 +176,31 @@ finally { if ($p -and $p.IsOpen) { $p.Close() } }
 }
 
 // Init balanza: leer config guardada y conectar si hay puerto configurado
-;(function initScale() {
+// NOTA: no se ejecuta al cargar el módulo — se llama desde main() solo
+// después de confirmar que no hay otra instancia ya usando el puerto serial
+// (dos instancias abriendo el mismo COM a la vez es lo que produce el error
+// "Uno de los dispositivos conectados al sistema no funciona").
+function initScale() {
   const cfg = loadConfig()
   if (cfg.scale?.port) {
     console.log('  [BALANZA] Conectando a', cfg.scale.port, '...')
     connectScale(cfg.scale)
   }
-})()
+}
+
+// Detecta si ya hay otra instancia de Finko Print Service escuchando en el
+// puerto — para salir en silencio en vez de pelear por el puerto 6788 y el
+// puerto serial de la balanza al mismo tiempo.
+function otraInstanciaActiva() {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ port: PORT, host: '127.0.0.1' })
+    const done = (activa) => { socket.destroy(); resolve(activa) }
+    socket.setTimeout(800)
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+}
 
 // ── Endpoints de balanza ──────────────────────────────────────────────────────
 
@@ -478,6 +497,25 @@ app.post('/test-print', async (req, res) => {
 })
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
+// Antes de escuchar en 6788 o abrir el puerto serial de la balanza, se
+// confirma que no haya ya otra instancia corriendo. Así una segunda ventana
+// se cierra en silencio en vez de pelear por el COM de la balanza (dos
+// SerialPort abriendo el mismo puerto a la vez producía el error
+// "Uno de los dispositivos conectados al sistema no funciona").
+async function main() {
+  if (await otraInstanciaActiva()) {
+    console.log('')
+    console.log('  Finko Print Service ya esta corriendo en el puerto ' + PORT + '.')
+    console.log('  Esta ventana se cerrara sola -- no es necesario abrir otra.')
+    console.log('')
+    setTimeout(() => process.exit(0), 3000)
+    return
+  }
+  initScale()
+  startServer()
+}
+
+function startServer() {
 const server = app.listen(PORT, async () => {
   selfInstall()
   console.log('')
@@ -517,6 +555,9 @@ server.on('error', (err) => {
   process.stdin.once('data', () => process.exit(1))
   setTimeout(() => process.exit(1), 15000)
 })
+}
+
+main()
 
 process.on('uncaughtException', (err) => {
   console.error('\n  ERROR inesperado:', err.message)

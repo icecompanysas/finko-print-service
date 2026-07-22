@@ -121,6 +121,7 @@ let scaleProc      = null  // proceso PowerShell leyendo el puerto
 let scaleLastLines = []    // últimas tramas crudas recibidas
 let scaleLastPeso  = null  // último peso en kg
 let scaleLastTime  = null  // timestamp del último peso
+let scaleRawBuf    = ''    // acumula bytes crudos hasta completar una trama (ETX)
 
 function applyScaleParser(line, parser) {
   if (!parser?.regex) return null
@@ -133,38 +134,105 @@ function applyScaleParser(line, parser) {
 }
 
 function connectScale(cfg) {
-  if (scaleProc) { try { scaleProc.kill() } catch {} scaleProc = null }
-  scaleLastPeso = null; scaleLastTime = null; scaleLastLines = []
+  const oldProc = scaleProc
+  scaleProc = null
+  scaleLastPeso = null; scaleLastTime = null; scaleLastLines = []; scaleRawBuf = ''
+
+  const startReader = () => connectScaleNow(cfg)
+
+  if (oldProc) {
+    // proc.kill() es asíncrono — Windows tarda un instante en liberar
+    // realmente el handle del puerto COM tras terminar el proceso. Si el
+    // siguiente proceso abre el puerto antes de que eso pase, choca con el
+    // mismo error "Uno de los dispositivos conectados al sistema no
+    // funciona" que tuvimos con la instancia duplicada, pero esta vez entre
+    // dos lectores propios. Por eso se espera el 'exit' real (con un
+    // fallback corto) antes de abrir el nuevo.
+    let started = false
+    const start = () => { if (!started) { started = true; startReader() } }
+    oldProc.once('exit', start)
+    try { oldProc.kill() } catch { start() }
+    setTimeout(start, 1500)
+  } else {
+    startReader()
+  }
+}
+
+function connectScaleNow(cfg) {
   if (!cfg?.port) return
 
-  // Leer el puerto serial con System.IO.Ports (.NET built-in en Windows)
-  // — mismo enfoque que la impresión con PowerShell, sin módulos nativos
+  // Acceso crudo al puerto vía CreateFile/ReadFile de Win32 (kernel32), en vez
+  // de System.IO.Ports.SerialPort de .NET: con ciertos adaptadores USB-serial
+  // CH340, SerialPort.Open() falla con "Uno de los dispositivos conectados al
+  // sistema no funciona" (ERROR_GEN_FAILURE) por una validación interna de
+  // .NET que ese driver no responde bien — mismo problema reproducible con
+  // PowerShell puro, fuera de este servicio. CreateFile/ReadFile evita esa
+  // ruta por completo. Además la báscula no envía líneas con '\n' sino tramas
+  // con caracteres de control (SOH/STX ... ETX/EOT/DLE), así que se lee en
+  // bytes crudos y se corta cada trama por ETX (0x03) en el lado de Node, en
+  // vez de usar ReadLine() (que nunca encuentra un '\n').
   const ps = `
 try {
-  $p = New-Object System.IO.Ports.SerialPort('${cfg.port}', ${cfg.baud || 9600}, 'None', 8, 1)
-  $p.ReadTimeout = 3000
-  $p.NewLine = "\`n"
-  $p.Open()
+  Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public class RawSerial {
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+  public static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool ReadFile(SafeFileHandle hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+}
+"@
+  & mode ${cfg.port}: BAUD=${cfg.baud || 9600} PARITY=n DATA=8 STOP=1 | Out-Null
+
+  $GENERIC_READ = [Convert]::ToUInt32('80000000', 16)
+  $handle = [RawSerial]::CreateFile('\\\\.\\${cfg.port}', $GENERIC_READ, [uint32]0, [IntPtr]::Zero, [uint32]3, [uint32]0, [IntPtr]::Zero)
+  if ($handle.IsInvalid) { throw "No se pudo abrir ${cfg.port}" }
+
+  $buf = New-Object byte[] 256
   while ($true) {
-    try { $line = $p.ReadLine(); if ($line) { Write-Host $line; [Console]::Out.Flush() } }
-    catch [System.TimeoutException] {}
+    [uint32]$read = 0
+    $ok = [RawSerial]::ReadFile($handle, $buf, [uint32]256, [ref]$read, [IntPtr]::Zero)
+    if ($ok -and $read -gt 0) {
+      Write-Host ([System.Text.Encoding]::ASCII.GetString($buf, 0, $read)) -NoNewline
+      [Console]::Out.Flush()
+    } elseif (-not $ok) {
+      throw "ReadFile fallo en ${cfg.port}"
+    }
   }
 } catch { Write-Error $_.Exception.Message }
-finally { if ($p -and $p.IsOpen) { $p.Close() } }
 `.trim()
 
   const proc = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 
+  const ETX = '\x03'
   proc.stdout.on('data', (data) => {
-    for (const raw of data.toString().split('\n')) {
-      const line = raw.replace(/\r/g, '').trim()
+    scaleRawBuf += data.toString()
+    let idx
+    while ((idx = scaleRawBuf.indexOf(ETX)) !== -1) {
+      const frame = scaleRawBuf.slice(0, idx + 1)
+      scaleRawBuf = scaleRawBuf.slice(idx + 1)
+      const line = frame.replace(/[\x00-\x1F\x7F]/g, '').trim()
       if (!line) continue
       scaleLastLines.unshift(line)
       if (scaleLastLines.length > 10) scaleLastLines.pop()
       const peso = applyScaleParser(line, cfg.parser)
       if (peso !== null) { scaleLastPeso = peso; scaleLastTime = Date.now() }
+    }
+    // Por si el protocolo real no usa ETX y el buffer nunca corta — evita que
+    // crezca sin límite mientras igual se sigue intentando parsear de a poco.
+    if (scaleRawBuf.length > 2000) {
+      const line = scaleRawBuf.replace(/[\x00-\x1F\x7F]/g, '').trim()
+      if (line) {
+        scaleLastLines.unshift(line)
+        if (scaleLastLines.length > 10) scaleLastLines.pop()
+        const peso = applyScaleParser(line, cfg.parser)
+        if (peso !== null) { scaleLastPeso = peso; scaleLastTime = Date.now() }
+      }
+      scaleRawBuf = ''
     }
   })
 
@@ -277,7 +345,7 @@ app.get('/balanza/peso', (_req, res) => {
 
 // Últimas líneas crudas (para diagnóstico y captura de muestra desde el frontend)
 app.get('/balanza/capture', (_req, res) => {
-  res.json({ lines: scaleLastLines, connected: !!scalePort })
+  res.json({ lines: scaleLastLines, connected: !!scaleProc })
 })
 
 // ─── Lista de impresoras via PowerShell ───────────────────────────────────────

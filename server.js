@@ -122,6 +122,7 @@ let scaleLastLines = []    // últimas tramas crudas recibidas
 let scaleLastPeso  = null  // último peso en kg
 let scaleLastTime  = null  // timestamp del último peso
 let scaleRawBuf    = ''    // acumula bytes crudos hasta completar una trama (ETX)
+let scaleRetryTimer = null // reintento automático si el puerto se cae (ej. se desconecta el cable USB)
 
 function applyScaleParser(line, parser) {
   if (!parser?.regex) return null
@@ -134,6 +135,7 @@ function applyScaleParser(line, parser) {
 }
 
 function connectScale(cfg) {
+  if (scaleRetryTimer) { clearTimeout(scaleRetryTimer); scaleRetryTimer = null }
   const oldProc = scaleProc
   scaleProc = null
   scaleLastPeso = null; scaleLastTime = null; scaleLastLines = []; scaleRawBuf = ''
@@ -237,7 +239,22 @@ public class RawSerial {
   })
 
   proc.stderr.on('data', (d) => console.error('  [BALANZA] Error:', d.toString().trim()))
-  proc.on('exit', (code) => { console.log('  [BALANZA] Proceso terminado, código', code); scaleProc = null })
+  proc.on('exit', (code) => {
+    console.log('  [BALANZA] Proceso terminado, código', code)
+    // Solo reintentar si nadie ya inició una reconexión propia (esta salida
+    // no fue reemplazada por otro connectScale() en curso) — así se cubre
+    // el caso de que se desconecte el cable USB de la báscula: al volver a
+    // conectarlo, se reintenta solo, sin que el usuario tenga que volver a
+    // guardar la configuración a mano.
+    if (scaleProc !== proc) return
+    scaleProc = null
+    if (cfg?.port && !scaleRetryTimer) {
+      scaleRetryTimer = setTimeout(() => {
+        scaleRetryTimer = null
+        if (!scaleProc) connectScaleNow(cfg)
+      }, 4000)
+    }
+  })
 
   scaleProc = proc
   console.log('  [BALANZA] Conectado a', cfg.port, '@', cfg.baud || 9600, 'bps')
